@@ -1,7 +1,7 @@
 use std::{ffi::CString, path::{Path, PathBuf}};
 
 use clap::Parser;
-use nix::{mount::{mount, MsFlags}, sched::{clone, CloneFlags}, sys::{signal::Signal, wait::wait}, unistd::{chdir, chroot, execvp, getgid, getuid, Gid, Uid}};
+use nix::{fcntl::{open, OFlag}, mount::{mount, MsFlags}, sched::{clone, CloneFlags}, sys::{signal::Signal, stat::Mode, wait::wait}, unistd::{chdir, chroot, close, execvp, getgid, getuid, setsid, Gid, Uid}};
 ///
 /// Tool for namespace isolation and execution for Renet.
 /// Running an executable w/(w/o) isolated namespaces and (or) chroot.
@@ -52,8 +52,10 @@ struct Args {
     /// set user to root
     #[arg(short, long, requires = "user")]
     root: bool,
-    
 
+    /// Detach session
+    #[arg(short, long)]
+    detach: bool,
 }
 struct UidMap<T: std::fmt::Display> {
     pub dst: T,
@@ -94,13 +96,33 @@ fn main() {
     }
     // before unshare, set user and group ids
     let child = || {
+        if args.detach {
+            setsid().unwrap();
+            chdir("/").unwrap();
+
+            close(0).unwrap();
+            close(1).unwrap();
+            close(2).unwrap();
+            let stdin = open("/dev/null", OFlag::O_RDWR, Mode::empty()).unwrap();
+            nix::unistd::dup(&stdin).unwrap(); // stdout
+            nix::unistd::dup(&stdin).unwrap(); // stderr
+        }
         if let Some(root) = args.chroot.clone() {
             chroot(&root).unwrap();
             chdir("/").unwrap();
         }
         // If PID and mount point is isolated and chroot to another space, also mount proc to /proc, so that the container has a clear view of processes.
-        if args.new_pid {
-            mount(Some("proc"), "/proc", Some("proc"), MsFlags::empty(), Some("")).unwrap();
+        if args.mount {
+            if args.chroot.is_none() {
+                mount(Some("none"), "/", Option::<&str>::None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, Option::<&str>::None).unwrap();
+            }
+
+            mount(Some("tmpfs"), "/tmp", Some("tmpfs"), MsFlags::empty(), Option::<&str>::None).unwrap();
+            mount(Some("tmpfs"), "/run", Some("tmpfs"), MsFlags::empty(), Option::<&str>::None).unwrap();
+            mount(Some("sysfs"), "/sys", Some("sysfs"), MsFlags::empty(), Option::<&str>::None).unwrap();
+            if args.process {
+                mount(Some("proc"), "/proc", Some("proc"), MsFlags::empty(), Some("")).unwrap();
+            }
         }
         let path = CString::new(args.path.to_str().unwrap()).unwrap();
         let args = std::iter::once(path.clone()).chain(args.args.iter().map(|s| CString::new(s.to_string()).unwrap())).collect::<Box<[_]>>();
@@ -109,6 +131,9 @@ fn main() {
     };
     let mut child_stack = [0u8; STACK_SIZE];
     let child_pid = unsafe { clone(Box::new(child), &mut child_stack, flags, Some(Signal::SIGCHLD as i32)) }.unwrap();
+    if args.detach {
+        println!("{}", child_pid);
+    }
     let err: Result<(), Box<dyn std::error::Error>> = (|| {
         if args.root {
             let uid_map_path = format!("/proc/{}/uid_map", child_pid);
@@ -128,6 +153,9 @@ fn main() {
     })();
     if let Err(e) = &err {
         println!("{:?}", e)
+    }
+    if args.detach {
+        return
     }
     wait().unwrap();
 }
